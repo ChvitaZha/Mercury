@@ -1,0 +1,186 @@
+using System.Collections.Generic;
+using UnityEngine;
+using Unity.Barracuda;
+using UnityEngine.UI;
+using System.Linq;
+using UnityEngine.Video;
+
+public class Test : MonoBehaviour
+{
+    public NNModel modelAsset; // 存储神经网络模型的资源
+    private Model m_RuntimeModel; // 运行时模型
+    private IWorker worker; // 用于执行模型推理的工作器
+
+    public VideoPlayer videoPlayer; // 视频播放器组件
+    public GameObject objPrefab; //obj物体
+    private int modelInputWidth = 640; // 模型期望的输入宽度
+    private int modelInputHeight = 640; // 模型期望的输入高度
+
+    private List<GameObject> createdBalls = new List<GameObject>(); // 保存已创建的球
+
+    private void Start()
+    {
+        m_RuntimeModel = ModelLoader.Load(modelAsset); // 加载神经网络模型
+        worker = WorkerFactory.CreateWorker(WorkerFactory.Type.ComputePrecompiled, m_RuntimeModel); // 创建工作器
+
+        videoPlayer.loopPointReached += OnVideoEnd; // 注册视频播放结束事件
+        videoPlayer.Play(); // 播放视频
+    }
+
+    private void OnDestroy()
+    {
+        videoPlayer.loopPointReached -= OnVideoEnd; // 取消注册视频播放结束事件
+    }
+
+    private void OnVideoEnd(VideoPlayer vp)
+    {
+        vp.Stop(); // 停止视频播放
+        vp.Play(); // 重新播放视频
+    }
+
+    private void Update()
+    {
+        if (videoPlayer.isPlaying) // 如果视频正在播放
+        {
+            Texture2D currentFrame = GetCurrentFrame(); // 获取当前视频帧
+            if (currentFrame != null)
+            {
+                ClearBalls(); // 清除上一帧创建的球
+                Predict(currentFrame); // 执行目标检测
+            }
+        }
+    }
+
+    public Texture2D GetCurrentFrame()
+    {
+        RenderTexture rt = videoPlayer.texture as RenderTexture; // 获取视频帧的渲染纹理
+        if (rt == null)
+            return null;
+
+        Texture2D tex = new Texture2D(rt.width, rt.height, TextureFormat.RGB24, false); // 创建新的纹理
+        RenderTexture.active = rt;
+        tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+        tex.Apply();
+        RenderTexture.active = null;
+
+        return tex;
+    }
+
+    private float nmsThreshold = 0.5f; // 非极大值抑制阈值
+
+
+    public void Predict(Texture2D inputTex)
+    {
+        // Resize input texture to match model input size
+        Texture2D resizedTex = ResizeTexture(inputTex, modelInputWidth, modelInputHeight);
+
+        using (Tensor inputTensor = new Tensor(resizedTex, channels: 3))
+        {
+            worker.Execute(inputTensor);
+            Tensor outputTensor = worker.PeekOutput();
+
+            List<(float confidence, Vector2 boxCenter, Vector2 boxSize)> detections = new List<(float, Vector2, Vector2)>();
+
+            for (int boxIndex = 0; boxIndex < outputTensor.width; boxIndex++)
+            {
+                float confidence = outputTensor[0, 0, boxIndex, 4];
+                if (confidence > 0.5f)
+                {
+                    Vector2 boxCenter = new Vector2(outputTensor[0, 0, boxIndex, 0], outputTensor[0, 0, boxIndex, 1]);
+                    Vector2 boxSize = new Vector2(outputTensor[0, 0, boxIndex, 2], outputTensor[0, 0, boxIndex, 3]);
+                    detections.Add((confidence, boxCenter, boxSize));
+                }
+            }
+
+            // 执行非极大值抑制
+            List<(float, Vector2, Vector2)> nmsDetections = PerformNonMaximumSuppression(detections);
+
+            ClearBalls(); // 清除上一帧创建的球
+
+            // 创建新的球
+            foreach (var (confidence, boxCenter, boxSize) in nmsDetections)
+            {
+                CreateBall(boxCenter, boxSize);
+            }
+        }
+    }
+
+
+    private List<(float, Vector2, Vector2)> PerformNonMaximumSuppression(List<(float, Vector2, Vector2)> detections)
+    {
+        List<(float, Vector2, Vector2)> nmsDetections = new List<(float, Vector2, Vector2)>();
+        List<(float, Vector2, Vector2)> sortedDetections = detections.OrderByDescending(d => d.Item1).ToList(); // 按置信度降序排序
+
+        while (sortedDetections.Count > 0)
+        {
+            (float confidence, Vector2 boxCenter, Vector2 boxSize) = sortedDetections[0];
+            nmsDetections.Add((confidence, boxCenter, boxSize));
+            sortedDetections.RemoveAt(0);
+
+            for (int i = sortedDetections.Count - 1; i >= 0; i--)
+            {
+                (float otherConfidence, Vector2 otherBoxCenter, Vector2 otherBoxSize) = sortedDetections[i];
+                float iou = CalculateIoU(boxCenter, boxSize, otherBoxCenter, otherBoxSize);
+                if (iou > nmsThreshold)
+                {
+                    sortedDetections.RemoveAt(i);
+                }
+            }
+        }
+
+        return nmsDetections;
+    }
+
+    private float CalculateIoU(Vector2 box1Center, Vector2 box1Size, Vector2 box2Center, Vector2 box2Size)
+    {
+        float x1 = box1Center.x - box1Size.x / 2;
+        float y1 = box1Center.y - box1Size.y / 2;
+        float x2 = box1Center.x + box1Size.x / 2;
+        float y2 = box1Center.y + box1Size.y / 2;
+
+        float x3 = box2Center.x - box2Size.x / 2;
+        float y3 = box2Center.y - box2Size.y / 2;
+        float x4 = box2Center.x + box2Size.x / 2;
+        float y4 = box2Center.y + box2Size.y / 2;
+
+        float left = Mathf.Max(x1, x3);
+        float right = Mathf.Min(x2, x4);
+        float bottom = Mathf.Max(y1, y3);
+        float top = Mathf.Min(y2, y4);
+
+        float interArea = Mathf.Max(0, right - left) * Mathf.Max(0, top - bottom);
+        float box1Area = (x2 - x1) * (y2 - y1);
+        float box2Area = (x4 - x3) * (y4 - y3);
+        float unionArea = box1Area + box2Area - interArea;
+
+        return interArea / unionArea;
+    }
+    // 创建球的方法
+    void CreateBall(Vector2 pos, Vector2 size)
+    {
+        float maxSize = Mathf.Max(size.x, size.y);
+        Vector2 newSize = new Vector2(maxSize, maxSize);
+
+        GameObject newObj = Instantiate(objPrefab, new Vector3(pos.x, pos.y, 0f), Quaternion.identity); // 实例化OBJ预制体
+        newObj.transform.localScale = new Vector3(newSize.x * 0.25f, newSize.y * 0.25f, newSize.x * 0.25f); // 将大小缩小到原来的0.5倍
+        createdBalls.Add(newObj); // 将新创建的OBJ添加到列表中
+    }
+
+    // 清除上一帧创建的球
+    void ClearBalls()
+    {
+        foreach (GameObject obj in createdBalls)
+        {
+            Destroy(obj); // 销毁之前创建的OBJ
+        }
+        createdBalls.Clear(); // 清空列表
+    }
+
+    // Resize input texture to match model input size
+    Texture2D ResizeTexture(Texture2D inputTex, int targetWidth, int targetHeight)
+    {
+        Texture2D resizedTex = new Texture2D(targetWidth, targetHeight);
+        Graphics.ConvertTexture(inputTex, resizedTex);
+        return resizedTex;
+    }
+}
